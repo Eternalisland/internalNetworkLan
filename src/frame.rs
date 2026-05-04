@@ -26,7 +26,7 @@ where R : AsyncRead + Unpin,
     let n = reader.read_line(&mut line).await?;
 
     if n == 0 {
-        println!("connection closed");
+        anyhow::bail!("connection closed");
     }
     let msg = serde_json::from_str::<T>(&line)?;
     Ok(msg)
