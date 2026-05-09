@@ -1,4 +1,1 @@
-
-fn serde () {
-    
-}
+fn serde() {}

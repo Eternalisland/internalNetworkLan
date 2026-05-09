@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 // 引入读写扩展 Trait
 
-
 #[tokio::main]
 async fn main() {
     run().await;
@@ -28,7 +27,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut buf = [0u8; 1024];
             // 读到的字节大小
             println!("connected to target: {}", target_addr);
-            match connect_with_timeout(target_addr,10).await {
+            match connect_with_timeout(target_addr, 10).await {
                 Ok(mut out_bound) => {
                     println!("connected to target: {}", target_addr);
                     match tokio::io::copy_bidirectional(&mut socket, &mut out_bound).await {
@@ -51,10 +50,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 use tokio::time::timeout;
-pub async fn connect_with_timeout(addr : &str, timeout_secs : u64) -> std::io::Result<TcpStream> {
+pub async fn connect_with_timeout(addr: &str, timeout_secs: u64) -> std::io::Result<TcpStream> {
     timeout(Duration::from_secs(timeout_secs), TcpStream::connect(addr))
         .await
-        .map_err( |_| {
+        .map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("connect timeout: {}", addr),
