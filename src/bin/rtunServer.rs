@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Local;
 use internalNetworkLan::config::{self, ServerConfig};
 use internalNetworkLan::control_message::{ControlMessage, ForwardRegistration};
 pub use internalNetworkLan::frame::{read_json_line, write_json_line};
@@ -721,7 +722,7 @@ fn log_error(component: &str, event: &str, fields: &[(&str, String)]) {
 fn log_line(level: &str, component: &str, event: &str, fields: &[(&str, String)]) {
     let mut line = format!(
         "ts={} level={} component={} event={}",
-        unix_timestamp_millis(),
+        format_current_time(),
         level,
         component,
         event
@@ -743,4 +744,8 @@ fn unix_timestamp_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn format_current_time() -> String {
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
