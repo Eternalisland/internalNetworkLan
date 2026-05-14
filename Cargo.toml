@@ -1,3 +1,4 @@
+# 更新内容：增加 socket2 依赖，用于配置隧道 TCP keepalive/nodelay 参数。
 [package]
 name = "internalNetworkLan"
 version = "0.1.0"
@@ -9,6 +10,7 @@ serde_json = "1.0.149"
 serde = { version = "1.0.228", features = ["derive"] }
 anyhow = "1.0.102"
 chrono = "0.4"
+socket2 = "0.6"
 
 [dev-dependencies]
 pretty_assertions = { version = "1" ,features = ["default"]}

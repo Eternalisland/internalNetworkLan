@@ -155,6 +155,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
 ]
 
