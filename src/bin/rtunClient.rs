@@ -1,4 +1,4 @@
-// 更新内容：增强客户端弱网稳定性，支持配置化超时、工作连接并发保护和预热 work 连接池。
+// 更新内容：增强客户端弱网稳定性，支持配置化超时、工作连接并发保护、可选预热 work 连接池；RDP 场景默认关闭预热池避免 3389 空连接被重置。
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ const DEFAULT_LOCAL_RETRY_DELAY_MIN_MS: u64 = 200;
 const DEFAULT_LOCAL_RETRY_DELAY_MAX_MS: u64 = 1000;
 const DEFAULT_SERVER_WORK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_CONCURRENT_WORK_CONNECTIONS: usize = 512;
-const DEFAULT_READY_WORK_POOL_SIZE_PER_PORT: usize = 2;
+const DEFAULT_READY_WORK_POOL_SIZE_PER_PORT: usize = 0;
 const DEFAULT_READY_WORK_RECONNECT_DELAY_MS: u64 = 500;
 const UDP_MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const UDP_LOCAL_SESSION_TTL: Duration = Duration::from_secs(120);
@@ -259,15 +259,9 @@ async fn connect_control_session(
                 token: token.to_string(),
                 forwards: forwards
                     .iter()
-                    .flat_map(|forward| {
-                        forward
-                            .protocol
-                            .expands_to()
-                            .into_iter()
-                            .map(move |protocol| ForwardRegistration {
-                                proxy_port: forward.proxy_port,
-                                protocol,
-                            })
+                    .map(|forward| ForwardRegistration {
+                        proxy_port: forward.proxy_port,
+                        protocol: forward.protocol,
                     })
                     .collect(),
                 proxy_port: None,
