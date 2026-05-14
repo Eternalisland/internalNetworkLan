@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Local;
 use internalNetworkLan::config::{self, ClientConfig, ClientForwardConfig};
 use internalNetworkLan::configure_tunnel_stream;
 use internalNetworkLan::control_message::TransportProtocol;
@@ -1096,7 +1097,7 @@ fn log_error(component: &str, event: &str, fields: &[(&str, String)]) {
 fn log_line(level: &str, component: &str, event: &str, fields: &[(&str, String)]) {
     let mut line = format!(
         "ts={} level={} component={} event={}",
-        unix_timestamp_millis(),
+        current_data_time(),
         level,
         component,
         event
@@ -1112,7 +1113,10 @@ fn log_line(level: &str, component: &str, event: &str, fields: &[(&str, String)]
         println!("{line}");
     }
 }
-
+fn current_data_time() -> String {
+    let local = Local::now();
+    local.format("%Y-%m-%d %H:%M:%S").to_string()
+}
 fn unix_timestamp_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
