@@ -10,8 +10,8 @@ use chrono::Local;
 use internalNetworkLan::config::{self, ServerConfig};
 use internalNetworkLan::configure_tunnel_stream;
 use internalNetworkLan::control_message::{ControlMessage, ForwardRegistration, TransportProtocol};
-use internalNetworkLan::udp::{UdpPacket, build_udp_data, parse_udp_packet};
 pub use internalNetworkLan::frame::{read_json_line, write_json_line};
+use internalNetworkLan::udp::{UdpPacket, build_udp_data, parse_udp_packet};
 use tokio::io;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -40,6 +40,7 @@ type SharedUdpSessionMap = Arc<Mutex<UdpSessionMap>>;
 #[derive(Clone)]
 struct ControlSession {
     session_id: u64,
+    client_id: String,
     work_token: String,
     sender: mpsc::Sender<ControlMessage>,
 }
@@ -195,7 +196,12 @@ async fn run_server(config: &ServerConfig) -> Result<()> {
     let port_limiters = Arc::new(
         forward_keys
             .iter()
-            .map(|key| (*key, Arc::new(Semaphore::new(runtime.max_connections_per_port))))
+            .map(|key| {
+                (
+                    *key,
+                    Arc::new(Semaphore::new(runtime.max_connections_per_port)),
+                )
+            })
             .collect::<HashMap<_, _>>(),
     );
 
@@ -465,6 +471,7 @@ async fn handle_client_connection(
     match message {
         ControlMessage::Hello {
             token,
+            client_id,
             forwards,
             proxy_port,
         } => {
@@ -484,6 +491,7 @@ async fn handle_client_connection(
             }
 
             let session_id = session_id_gen.fetch_add(1, Ordering::Relaxed);
+            let client_id = normalize_client_id(client_id, session_id)?;
             let work_token = generate_work_token(session_id);
             let stream = reader.into_inner();
 
@@ -493,6 +501,7 @@ async fn handle_client_connection(
                 &[
                     ("peer_addr", format!("{:?}", stream.peer_addr()?)),
                     ("session_id", session_id.to_string()),
+                    ("client_id", format!("{client_id:?}")),
                     ("forwards", format!("{registered_forwards:?}")),
                 ],
             );
@@ -504,6 +513,7 @@ async fn handle_client_connection(
                 udp_clients,
                 registered_forwards,
                 session_id,
+                client_id,
                 work_token,
                 runtime,
             )
@@ -565,6 +575,7 @@ async fn handle_control_connection(
     udp_clients: SharedUdpClientMap,
     registered_forwards: Vec<SessionKey>,
     session_id: u64,
+    client_id: String,
     work_token: String,
     runtime: Arc<ServerRuntimeConfig>,
 ) -> Result<()> {
@@ -573,14 +584,31 @@ async fn handle_control_connection(
     // 端口注册必须是一个原子动作：先在同一把锁里检查所有端口是否空闲，
     // 再一次性插入当前 session。这样可以避免两个客户端并发连接时都认为
     // 端口可用，最后出现后注册的客户端覆盖先注册客户端的问题。
-    register_control_session(
+    let replaced_session_ids = register_control_session(
         &session_map,
         &registered_forwards,
         session_id,
+        &client_id,
         &work_token,
         tx.clone(),
     )
     .await?;
+
+    // 同一 client_id 的新控制连接已经成功注册后，旧 session 不再拥有端口。
+    // 立即清理旧 session 的预热连接和 UDP 地址，避免新连接仍取到旧隧道资源。
+    for replaced_session_id in replaced_session_ids {
+        clear_ready_work_for_session(&ready_pool, replaced_session_id).await;
+        clear_udp_client_for_session(&udp_clients, replaced_session_id).await;
+        log_warn(
+            "control",
+            "session_taken_over",
+            &[
+                ("client_id", format!("{client_id:?}")),
+                ("old_session_id", replaced_session_id.to_string()),
+                ("new_session_id", session_id.to_string()),
+            ],
+        );
+    }
 
     match time::timeout(
         runtime.control_send_timeout,
@@ -668,10 +696,7 @@ async fn handle_control_connection(
                     return Err(anyhow!("control read error: {}", error));
                 }
                 Err(_) => {
-                    return Err(anyhow!(
-                        "control read timeout, session_id={}",
-                        session_id
-                    ));
+                    return Err(anyhow!("control read timeout, session_id={}", session_id));
                 }
             }
         }
@@ -782,10 +807,16 @@ async fn handle_user_connection(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             remove_pending_connection(&pending_map, conn_id).await;
-            return Err(anyhow!("failed to send new_conn, id={}, error={:?}", conn_id, error));
+            evict_control_session(&session_map, control.session_id).await;
+            return Err(anyhow!(
+                "failed to send new_conn, id={}, error={:?}",
+                conn_id,
+                error
+            ));
         }
         Err(error) => {
             remove_pending_connection(&pending_map, conn_id).await;
+            evict_control_session(&session_map, control.session_id).await;
             return Err(anyhow!(
                 "failed to send new_conn within {:?}, id={}, error={:?}",
                 runtime.control_send_timeout,
@@ -1181,34 +1212,43 @@ async fn register_control_session(
     session_map: &SharedSessionMap,
     registered_forwards: &[SessionKey],
     session_id: u64,
+    client_id: &str,
     work_token: &str,
     sender: mpsc::Sender<ControlMessage>,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     let mut guard = session_map.lock().await;
+    let mut replaced_session_ids = HashSet::new();
 
     for key in registered_forwards {
         if let Some(existing) = guard.get(key) {
-            anyhow::bail!(
-                "proxy port {} protocol {:?} already registered by active session {}",
-                key.0,
-                key.1,
-                existing.session_id
-            );
+            if existing.client_id != client_id {
+                anyhow::bail!(
+                    "proxy port {} protocol {:?} already registered by client {} session {}",
+                    key.0,
+                    key.1,
+                    existing.client_id,
+                    existing.session_id
+                );
+            }
+            replaced_session_ids.insert(existing.session_id);
         }
     }
 
+    // 只有相同 client_id 才允许接管端口。旧控制连接即使处于 TCP 半开状态，
+    // 新连接也能立即恢复服务；不同客户端仍然会被严格拒绝，避免端口劫持。
     for key in registered_forwards {
         guard.insert(
             *key,
             ControlSession {
                 session_id,
+                client_id: client_id.to_string(),
                 work_token: work_token.to_string(),
                 sender: sender.clone(),
             },
         );
     }
 
-    Ok(())
+    Ok(replaced_session_ids.into_iter().collect())
 }
 
 async fn clear_control_session(
@@ -1225,6 +1265,24 @@ async fn clear_control_session(
         if should_remove {
             guard.remove(key);
         }
+    }
+}
+
+async fn evict_control_session(session_map: &SharedSessionMap, session_id: u64) {
+    let mut guard = session_map.lock().await;
+    let before = guard.len();
+    guard.retain(|_, session| session.session_id != session_id);
+    let removed = before.saturating_sub(guard.len());
+
+    if removed > 0 {
+        log_warn(
+            "control",
+            "unhealthy_session_evicted",
+            &[
+                ("session_id", session_id.to_string()),
+                ("removed_forwards", removed.to_string()),
+            ],
+        );
     }
 }
 
@@ -1332,7 +1390,8 @@ async fn ready_work_cleanup_loop(
 
     loop {
         interval.tick().await;
-        let removed = cleanup_stale_ready_work_connections(&ready_pool, runtime.ready_work_ttl).await;
+        let removed =
+            cleanup_stale_ready_work_connections(&ready_pool, runtime.ready_work_ttl).await;
 
         if removed > 0 {
             log_warn(
@@ -1364,10 +1423,7 @@ async fn cleanup_stale_ready_work_connections(
     removed
 }
 
-async fn pending_cleanup_loop(
-    pending_map: SharedPendingMap,
-    runtime: Arc<ServerRuntimeConfig>,
-) {
+async fn pending_cleanup_loop(pending_map: SharedPendingMap, runtime: Arc<ServerRuntimeConfig>) {
     let mut interval = tokio::time::interval(runtime.pending_sweep_interval);
 
     loop {
@@ -1452,6 +1508,16 @@ fn normalize_registered_forwards(
     }
 
     Ok(keys)
+}
+
+fn normalize_client_id(client_id: Option<String>, session_id: u64) -> Result<String> {
+    match client_id {
+        Some(client_id) if !client_id.trim().is_empty() => Ok(client_id.trim().to_string()),
+        Some(_) => Err(anyhow!("client_id must not be empty")),
+        // 兼容旧客户端，但旧协议连接没有稳定身份，因此不能安全接管已有端口。
+        // 每次连接使用不同 ID，可继续保持“重复端口严格拒绝”的旧行为。
+        None => Ok(format!("legacy-session-{session_id}")),
+    }
 }
 
 fn expand_server_forward_keys(
@@ -1568,4 +1634,52 @@ fn unix_timestamp_millis() -> u128 {
 
 fn format_current_time() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_client_can_take_over_existing_forward() {
+        let session_map: SharedSessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let key = (7001, TransportProtocol::Tcp);
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+
+        let replaced =
+            register_control_session(&session_map, &[key], 1, "client-a", "token-1", first_tx)
+                .await
+                .unwrap();
+        assert!(replaced.is_empty());
+
+        let replaced =
+            register_control_session(&session_map, &[key], 2, "client-a", "token-2", second_tx)
+                .await
+                .unwrap();
+        assert_eq!(replaced, vec![1]);
+
+        clear_control_session(&session_map, &[key], 1).await;
+        let guard = session_map.lock().await;
+        assert_eq!(guard.get(&key).unwrap().session_id, 2);
+    }
+
+    #[tokio::test]
+    async fn different_client_cannot_take_over_existing_forward() {
+        let session_map: SharedSessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let key = (7001, TransportProtocol::Tcp);
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+
+        register_control_session(&session_map, &[key], 1, "client-a", "token-1", first_tx)
+            .await
+            .unwrap();
+        let error =
+            register_control_session(&session_map, &[key], 2, "client-b", "token-2", second_tx)
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("already registered by client"));
+        assert_eq!(session_map.lock().await.get(&key).unwrap().session_id, 1);
+    }
 }

@@ -12,8 +12,8 @@ use internalNetworkLan::control_message::TransportProtocol;
 use internalNetworkLan::udp::{UdpPacket, build_udp_data, build_udp_register, parse_udp_packet};
 use internalNetworkLan::{ControlMessage, ForwardRegistration, read_json_line, write_json_line};
 use tokio::io::BufReader;
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, Duration};
 
@@ -123,7 +123,15 @@ async fn main() -> Result<()> {
     let config = load_client_config()?;
     let forwards = config.normalized_forwards()?;
     let runtime = ClientRuntimeConfig::from(&config);
-    run_client(&config.server_addr, forwards, config.token, runtime).await?;
+    let client_id = resolve_client_id(config.client_id.as_deref(), &forwards)?;
+    run_client(
+        &config.server_addr,
+        forwards,
+        config.token,
+        client_id,
+        runtime,
+    )
+    .await?;
     Ok(())
 }
 
@@ -140,6 +148,7 @@ fn load_client_config() -> Result<ClientConfig> {
         Ok(ClientConfig {
             server_addr: "localhost:7000".into(),
             token: "dev-token".into(),
+            client_id: None,
             forwards: vec![ClientForwardConfig {
                 proxy_port: 7001,
                 local_addr: "localhost:63306".into(),
@@ -167,6 +176,7 @@ async fn run_client(
     server_addr: &str,
     forwards: Vec<ClientForwardConfig>,
     token: String,
+    client_id: String,
     runtime: ClientRuntimeConfig,
 ) -> Result<()> {
     let mut backoff = RECONNECT_DELAY_MIN;
@@ -175,7 +185,15 @@ async fn run_client(
     let runtime = Arc::new(runtime);
 
     loop {
-        match connect_control_session(server_addr, &token, &forwards, Arc::clone(&runtime)).await {
+        match connect_control_session(
+            server_addr,
+            &token,
+            &client_id,
+            &forwards,
+            Arc::clone(&runtime),
+        )
+        .await
+        {
             Ok(session) => {
                 backoff = RECONNECT_DELAY_MIN;
                 log_info(
@@ -222,18 +240,22 @@ async fn run_client(
 async fn connect_control_session(
     server_addr: &str,
     token: &str,
+    client_id: &str,
     forwards: &[ClientForwardConfig],
     runtime: Arc<ClientRuntimeConfig>,
 ) -> Result<ClientControlSession> {
-    let stream = time::timeout(runtime.control_connect_timeout, TcpStream::connect(server_addr))
-        .await
-        .with_context(|| {
-            format!(
-                "timed out connecting to server control at {server_addr} after {:?}",
-                runtime.control_connect_timeout
-            )
-        })?
-        .with_context(|| format!("failed to connect to server control at {server_addr}"))?;
+    let stream = time::timeout(
+        runtime.control_connect_timeout,
+        TcpStream::connect(server_addr),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out connecting to server control at {server_addr} after {:?}",
+            runtime.control_connect_timeout
+        )
+    })?
+    .with_context(|| format!("failed to connect to server control at {server_addr}"))?;
     if let Err(error) = configure_tunnel_stream(&stream) {
         log_warn(
             "control",
@@ -257,6 +279,7 @@ async fn connect_control_session(
             &mut write,
             &ControlMessage::Hello {
                 token: token.to_string(),
+                client_id: Some(client_id.to_string()),
                 forwards: forwards
                     .iter()
                     .map(|forward| ForwardRegistration {
@@ -497,6 +520,48 @@ fn build_forward_map(
     }
 
     Ok(map)
+}
+
+fn resolve_client_id(
+    configured_client_id: Option<&str>,
+    forwards: &[ClientForwardConfig],
+) -> Result<String> {
+    if let Some(client_id) = configured_client_id {
+        let client_id = client_id.trim();
+        if client_id.is_empty() {
+            anyhow::bail!("client_id must not be empty");
+        }
+        return Ok(client_id.to_string());
+    }
+
+    // client_id 用于识别“同一个客户端的断线重连”。自动值包含主机名和转发配置，
+    // 因此同一客户端进程重启后仍会得到相同 ID，而其他机器即使使用相同 token，
+    // 也不会被允许接管该客户端已经注册的端口。生产环境建议显式配置 client_id。
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let mut identity_parts = forwards
+        .iter()
+        .map(|forward| {
+            format!(
+                "{}:{:?}:{}",
+                forward.proxy_port, forward.protocol, forward.local_addr
+            )
+        })
+        .collect::<Vec<_>>();
+    identity_parts.sort();
+    let identity = format!("{}|{}", hostname, identity_parts.join("|"));
+
+    Ok(format!("auto-{:016x}", fnv1a_64(identity.as_bytes())))
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn spawn_ready_work_pool(
@@ -784,7 +849,12 @@ async fn connect_local_service_with_retry(
             ],
         );
 
-        match time::timeout(runtime.local_connect_timeout, TcpStream::connect(local_addr)).await {
+        match time::timeout(
+            runtime.local_connect_timeout,
+            TcpStream::connect(local_addr),
+        )
+        .await
+        {
             Ok(Ok(stream)) => {
                 log_info(
                     "local",
@@ -828,7 +898,10 @@ async fn connect_local_service_with_retry(
                     &[
                         ("conn_id", conn_label.to_string()),
                         ("attempt", attempt.to_string()),
-                        ("timeout_ms", runtime.local_connect_timeout.as_millis().to_string()),
+                        (
+                            "timeout_ms",
+                            runtime.local_connect_timeout.as_millis().to_string(),
+                        ),
                     ],
                 );
                 last_error = Some(format!(
@@ -1116,4 +1189,37 @@ fn unix_timestamp_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_client_id_is_used_as_stable_identity() {
+        let forwards = vec![ClientForwardConfig {
+            proxy_port: 7001,
+            local_addr: "127.0.0.1:3389".to_string(),
+            protocol: TransportProtocol::Tcp,
+        }];
+
+        assert_eq!(
+            resolve_client_id(Some("rdp-client-a"), &forwards).unwrap(),
+            "rdp-client-a"
+        );
+    }
+
+    #[test]
+    fn automatic_client_id_is_stable_for_same_forwards() {
+        let forwards = vec![ClientForwardConfig {
+            proxy_port: 7001,
+            local_addr: "127.0.0.1:3389".to_string(),
+            protocol: TransportProtocol::Tcp,
+        }];
+
+        assert_eq!(
+            resolve_client_id(None, &forwards).unwrap(),
+            resolve_client_id(None, &forwards).unwrap()
+        );
+    }
 }

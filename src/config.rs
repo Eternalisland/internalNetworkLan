@@ -44,6 +44,8 @@ pub struct ClientConfig {
     pub server_addr: String,
     pub token: String,
     #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
     pub forwards: Vec<ClientForwardConfig>,
     #[serde(default)]
     pub local_addr: Option<String>,
@@ -100,7 +102,9 @@ impl ServerConfig {
                 .collect());
         }
 
-        Err(anyhow!("server config requires proxy_forwards or proxy_ports"))
+        Err(anyhow!(
+            "server config requires proxy_forwards or proxy_ports"
+        ))
     }
 }
 

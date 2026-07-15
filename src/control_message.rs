@@ -39,6 +39,8 @@ pub enum ControlMessage {
     Hello {
         token: String,
         #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
         forwards: Vec<ForwardRegistration>,
         #[serde(default)]
         proxy_port: Option<u16>,
